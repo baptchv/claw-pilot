@@ -6,6 +6,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ---
 
+## [Unreleased]
+
+### Added
+- **ServerRegistry abstraction** — introduces `ServerRegistry` as the single entry point for "which server serves which resource". Community ships `SingleServerRegistry` (always local); Enterprise will plug a `FederatedServerRegistry` via the `multi-server` capability. See [docs/architecture/server-registry.md](docs/architecture/server-registry.md) and the H3 plan in `docs/superpowers/plans/`.
+
+---
+
 ## [0.80.6] — 2026-04-20
 
 ### Added
