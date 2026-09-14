@@ -40,7 +40,8 @@ import {
   DoomLoopDetected,
   AgentTimeout,
 } from "../../bus/events.js";
-import { runPromptLoop } from "../prompt-loop.js";
+import { runPromptLoop, estimateRequestTokens } from "../prompt-loop.js";
+import * as compactionModule from "../compaction.js";
 import type { ResolvedModel } from "../../provider/provider.js";
 import type { RuntimeAgentConfig } from "../../config/index.js";
 import { getTools } from "../../tool/registry.js";
@@ -155,6 +156,46 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("runPromptLoop — happy path", () => {
+  it("compacts existing history before adding the next user message", async () => {
+    const session = createSession(db, { instanceSlug: INSTANCE_SLUG, agentId: "main" });
+    const oldMessage = createAssistantMessage(db, {
+      sessionId: session.id,
+      agentId: "main",
+      model: "test",
+    });
+    createPart(db, { messageId: oldMessage.id, type: "text", content: "Earlier context" });
+    const messageCounts: number[] = [];
+    const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async () => {
+      messageCounts.push(listMessages(db, session.id).length);
+      return { compacted: true, compactionMessageId: undefined };
+    });
+    try {
+      await runPromptLoop({
+        db,
+        instanceSlug: INSTANCE_SLUG,
+        sessionId: session.id,
+        userText: "Current request",
+        agentConfig: makeAgentConfig(),
+        resolvedModel: makeResolvedModel(textStreamModel("Done")),
+        workDir: undefined,
+        compactionConfig: {
+          auto: true,
+          threshold: 0,
+          reservedTokens: 8_000,
+          periodicMessageCount: 0,
+        },
+      });
+      expect(messageCounts[0]).toBe(1);
+    } finally {
+      compactSpy.mockRestore();
+    }
+  });
+
+  it("includes prompt, history, and new request in the preflight estimate", () => {
+    expect(estimateRequestTokens("abc", [{ role: "user", content: "history" }], "next")).toBe(
+      Math.ceil((3 + JSON.stringify([{ role: "user", content: "history" }]).length + 4) / 3),
+    );
+  });
   it("returns the correct text from the LLM", async () => {
     const session = createSession(db, { instanceSlug: INSTANCE_SLUG, agentId: "main" });
     const model = textStreamModel("Hello, world!");
