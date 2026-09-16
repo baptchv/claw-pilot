@@ -254,7 +254,18 @@ export async function runPromptLoop(input: PromptLoopInput): Promise<PromptLoopR
   try {
     // Compact existing history before persisting the new user turn, so that
     // the incoming request remains verbatim instead of being folded into a summary.
-    await compactBeforeResponse(input, session, bus);
+    await watchdog.onLongWait(() =>
+      compactBeforeResponse(
+        input,
+        session,
+        bus,
+        AbortSignal.any([
+          watchdog.fullAbort,
+          AbortSignal.timeout(agentConfig.timeoutMs ?? 5 * 60 * 1000),
+        ]),
+      ),
+    );
+    watchdog.fullAbort.throwIfAborted();
 
     // 1. Create user message + permission feedback messages
     createUserMessages(input, bus, permissionFeedbackMessages);
@@ -344,6 +355,7 @@ async function compactBeforeResponse(
   input: PromptLoopInput,
   session: { channel: string },
   bus: ReturnType<typeof getBus>,
+  abortSignal: AbortSignal,
 ): Promise<void> {
   const { db, sessionId, agentConfig, resolvedModel, instanceSlug } = input;
   const settings = input.compactionConfig ?? {
@@ -371,7 +383,10 @@ async function compactBeforeResponse(
   )
     return;
 
+  preBudgetCheck(db, instanceSlug, agentConfig.id);
   await compact({
+    abortSignal,
+    manageSessionStatus: false,
     db,
     instanceSlug,
     sessionId,

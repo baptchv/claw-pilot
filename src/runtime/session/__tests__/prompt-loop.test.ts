@@ -155,6 +155,116 @@ afterEach(() => {
 // Happy path
 // ---------------------------------------------------------------------------
 
+describe("runPromptLoop — preflight compaction", () => {
+  function setup() {
+    const session = createSession(db, { instanceSlug: INSTANCE_SLUG, agentId: "main" });
+    const message = createAssistantMessage(db, {
+      sessionId: session.id,
+      agentId: "main",
+      model: "test",
+    });
+    createPart(db, {
+      messageId: message.id,
+      type: "text",
+      content: "Earlier context. ".repeat(2000),
+    });
+    const statuses: string[] = [];
+    getBus(INSTANCE_SLUG).subscribe(SessionStatusChanged, ({ status }) => statuses.push(status));
+    const input = {
+      db,
+      instanceSlug: INSTANCE_SLUG,
+      sessionId: session.id,
+      userText: "Keep this request verbatim",
+      agentConfig: makeAgentConfig({ chunkTimeoutMs: 1000, timeoutMs: 30_000 }),
+      resolvedModel: makeResolvedModel(textStreamModel("Done")),
+      workDir: undefined,
+      compactionConfig: {
+        auto: true,
+        threshold: 0.01,
+        reservedTokens: 8000,
+        periodicMessageCount: 0,
+      },
+    };
+    return { input, statuses };
+  }
+
+  function summaryResult() {
+    return {
+      content: [{ type: "text" as const, text: "Earlier context summarized" }],
+      finishReason: { unified: "stop" as const, raw: "stop" },
+      usage: {
+        inputTokens: { total: 10, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
+        outputTokens: { total: 5, text: undefined, reasoning: undefined },
+      },
+      warnings: [],
+    };
+  }
+
+  it("keeps the session busy until the response finishes and preserves the current request", async () => {
+    const { input, statuses } = setup();
+    const summary = new MockLanguageModelV3({ doGenerate: async () => summaryResult() });
+    const result = await runPromptLoop({
+      ...input,
+      internalResolvedModel: makeResolvedModel(summary),
+    });
+    expect(result.text).toBe("Done");
+    expect(statuses).toEqual(["busy", "idle"]);
+    const active = listMessagesFromCompaction(db, input.sessionId);
+    expect(
+      active.some((message) =>
+        listParts(db, message.id).some((part) => part.content === input.userText),
+      ),
+    ).toBe(true);
+  });
+
+  it("allows slow compaction without expiring the response chunk watchdog", async () => {
+    vi.useFakeTimers();
+    try {
+      const { input } = setup();
+      const summary = new MockLanguageModelV3({
+        doGenerate: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 6000));
+          return summaryResult();
+        },
+      });
+      const pending = runPromptLoop({
+        ...input,
+        internalResolvedModel: makeResolvedModel(summary),
+      });
+      await Promise.all([
+        expect(pending).resolves.toMatchObject({ text: "Done" }),
+        vi.advanceTimersByTimeAsync(6500),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels the summary request without persisting a new turn or starting a response", async () => {
+    const { input, statuses } = setup();
+    const controller = new AbortController();
+    let signal: AbortSignal | undefined;
+    const summary = new MockLanguageModelV3({
+      doGenerate: async (options) => {
+        signal = options.abortSignal;
+        controller.abort(new Error("Cancelled during compaction"));
+        signal?.throwIfAborted();
+        return summaryResult();
+      },
+    });
+    await expect(
+      runPromptLoop({
+        ...input,
+        abort: controller.signal,
+        internalResolvedModel: makeResolvedModel(summary),
+      }),
+    ).rejects.toThrow();
+    expect(signal?.aborted).toBe(true);
+    expect(listMessages(db, input.sessionId)).toHaveLength(1);
+    expect(statuses).toEqual(["busy", "idle"]);
+  });
+});
+
 describe("runPromptLoop — happy path", () => {
   it("compacts existing history before adding the next user message", async () => {
     const session = createSession(db, { instanceSlug: INSTANCE_SLUG, agentId: "main" });
